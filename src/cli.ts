@@ -33,6 +33,7 @@ const clr = {
 };
 
 const CURRENT_WORKING_DIR = process.cwd(); 
+const execAsync = promisify(exec);
 
 // --- HELPER FUNCTIONS ---
 
@@ -44,7 +45,6 @@ async function getFileTree(dir: string, depth: number = 0, maxDepth: number = 2)
     let output = "";
     
     for (const file of files) {
-      // Ignore common clutter folders to keep the tree clean
       if (['node_modules', '.git', 'dist', '.next', '.DS_Store', 'coverage'].includes(file)) continue; 
       
       const fullPath = path.join(dir, file);
@@ -58,9 +58,32 @@ async function getFileTree(dir: string, depth: number = 0, maxDepth: number = 2)
       }
     }
     return output;
-  } catch (e) {
-    return ""; // Skip folders we can't read
-  }
+  } catch (e) { return ""; }
+}
+
+// Helper to print stream events (Standardizes output)
+async function printStream(stream: any) {
+    for await (const event of stream) {
+      const [nodeName, output] = Object.entries(event)[0];
+
+      if (nodeName === 'Agent') {
+        const messages = (output as any).messages;
+        if (messages?.length) {
+          const lastMsg = messages[messages.length - 1] as AIMessage;
+          if (lastMsg.content) console.log(`\n${clr.cyan}🤖 Agent:${clr.reset} ${lastMsg.content}`);
+        }
+      }
+      if (nodeName === 'tools') {
+         const messages = (output as any).messages;
+         if (messages?.length) {
+            const lastMsg = messages[messages.length - 1];
+            // Print the actual output from the tool (e.g. command result)
+            if (lastMsg.content) {
+               console.log(`${clr.green}📜 Output:${clr.reset}\n${lastMsg.content}`);
+            }
+         }
+      }
+    }
 }
 
 // --- TOOLS ---
@@ -77,12 +100,12 @@ const searchTool = tool(
   },
   { 
     name: "tavily_search", 
-    description: "Search the web for documentation, library versions, or error solutions.", 
+    description: "Search the web for docs, library versions, or error fixes.", 
     schema: z.object({ query: z.string() }) 
   }
 );
 
-// 2. Smart Recursive List Files
+// 2. Smart List Files
 const listFilesTool = tool(
   async ({ dirPath, depth }) => {
     try {
@@ -92,46 +115,70 @@ const listFilesTool = tool(
   },
   { 
     name: "list_files", 
-    description: "View the project file structure as a tree. Use 'depth' (default 2) to see subfolders.", 
+    description: "View project file structure. Use 'depth' (default 2) to see subfolders.", 
     schema: z.object({ dirPath: z.string().optional(), depth: z.number().optional() }) 
   }
 );
 
-// 3. Smart Read File (Line Numbers & Ranges)
+// 3. Smart Read File
 const readFileTool = tool(
   async ({ filePath, startLine, endLine }) => {
     try {
       const target = path.resolve(CURRENT_WORKING_DIR, filePath);
-      
-      // Basic Security
-      if (filePath.includes('.env') || filePath.includes('id_rsa')) {
-        return "⚠️ Error: Access to sensitive files (keys/secrets) is restricted for security.";
-      }
+      if (filePath.includes('.env') || filePath.includes('id_rsa')) return "⚠️ Error: Restricted file.";
 
       const content = await fs.readFile(target, 'utf-8');
       const lines = content.split('\n');
-      
       const start = startLine ? startLine - 1 : 0;
       const end = endLine ? endLine : lines.length;
       
-      // Limit to 300 lines per read to prevent context overflow
-      if (end - start > 300) {
-        return `⚠️ Error: The file is too large to read at once. Please read chunks of 300 lines or less. (Example: startLine: ${start + 1}, endLine: ${start + 300})`;
-      }
+      if (end - start > 300) return `⚠️ Error: File too large. Read lines ${start + 1}-${start + 300} instead.`;
 
-      // Add line numbers to the output
-      const selectedLines = lines.slice(start, end).map((line, i) => `${start + i + 1}: ${line}`);
-      return selectedLines.join('\n');
+      return lines.slice(start, end).map((line, i) => `${start + i + 1}: ${line}`).join('\n');
     } catch (e: any) { return `Error: ${e.message}`; }
   },
   { 
     name: "read_file", 
-    description: "Read file content with line numbers. Use startLine/endLine to read large files in chunks.", 
+    description: "Read file content with line numbers.", 
     schema: z.object({ 
       filePath: z.string(),
-      startLine: z.number().optional().describe("Start line number (1-based)"),
-      endLine: z.number().optional().describe("End line number (inclusive)")
+      startLine: z.number().optional(),
+      endLine: z.number().optional()
     }) 
+  }
+);
+
+// 4. Write File (The Writer Module)
+const writeFileTool = tool(
+  async ({ filePath, content }) => {
+    try {
+      const target = path.resolve(CURRENT_WORKING_DIR, filePath);
+      await fs.writeFile(target, content);
+      return `✅ Successfully wrote to ${filePath}`;
+    } catch (e: any) { return `Error: ${e.message}`; }
+  },
+  {
+    name: "write_file",
+    description: "Write content to a file. Overwrites existing files.",
+    schema: z.object({ filePath: z.string(), content: z.string() })
+  }
+);
+
+// 5. Terminal (The Execution Module)
+const terminalTool = tool(
+  async ({ command }) => {
+    try {
+      if (command.includes('rm -rf') || command.includes('sudo') || command.includes('format')) {
+        return "❌ Error: Command blocked for safety.";
+      }
+      const { stdout, stderr } = await execAsync(command, { cwd: CURRENT_WORKING_DIR });
+      return stdout || stderr || "✅ Command executed successfully (no output).";
+    } catch (e: any) { return `Error: ${e.message}`; }
+  },
+  {
+    name: "terminal",
+    description: "Execute safe terminal commands (npm, git, node, etc).",
+    schema: z.object({ command: z.string() })
   }
 );
 
@@ -145,7 +192,6 @@ if (!process.env.GROQ_API_KEY) {
   process.exit(1);
 }
 
-// Initializing Llama 3 for best tool-calling performance
 const llm = new ChatGroq({
   model: "llama-3.3-70b-versatile", 
   temperature: 0,
@@ -155,22 +201,22 @@ const llm = new ChatGroq({
 // --- NODE LOGIC ---
 
 const agentNode = async (state: typeof AgentState.State) => {
-  const tools = [listFilesTool, readFileTool, searchTool];
+  const tools = [listFilesTool, readFileTool, searchTool, writeFileTool, terminalTool];
   const nodeLLM = llm.bindTools(tools);
   
   const systemMsg = new SystemMessage(`
     You are a Senior Developer Assistant.
-    You have access to the files in: ${CURRENT_WORKING_DIR}
+    You have access to: ${CURRENT_WORKING_DIR}
 
-    GOAL: Answer the user's questions accurately by reading their code or searching the web.
+    CAPABILITIES:
+    1. **See:** Use 'list_files' and 'read_file' to explore code.
+    2. **Research:** Use 'tavily_search' for docs/errors.
+    3. **Act:** Use 'write_file' to fix code and 'terminal' to run commands.
 
-    GUIDELINES:
-    1. **Context First:** Always use 'list_files' to see the project structure before guessing file names.
-    2. **Smart Reading:** - If a file seems large, read the first 100 lines (startLine: 1, endLine: 100).
-       - If you need to see a specific function, read the lines around it.
-       - Use the Line Numbers provided in the output to reference code in your answer (e.g., "The bug is on line 42").
-    3. **Web Search:** Use 'tavily_search' for libraries, errors, or documentation.
-    4. **Be Concise:** Don't dump code unless asked. Explain the solution.
+    RULES:
+    - **Context First:** Look before you leap. Read files before editing them.
+    - **Safety:** You must be precise when writing code.
+    - **Verification:** After writing code, try to run it (e.g., 'node file.js') if appropriate to verify it works.
   `);
 
   const response = await nodeLLM.invoke([systemMsg, ...state.messages]);
@@ -180,11 +226,10 @@ const agentNode = async (state: typeof AgentState.State) => {
 // --- GRAPH CONSTRUCTION ---
 const workflow = new StateGraph(AgentState)
   .addNode("Agent", agentNode)
-  .addNode("tools", new ToolNode([listFilesTool, readFileTool, searchTool]))
+  .addNode("tools", new ToolNode([listFilesTool, readFileTool, searchTool, writeFileTool, terminalTool]))
 
   .addEdge(START, "Agent")
   
-  // Logic: If the agent calls a tool, go to 'tools', otherwise END.
   .addConditionalEdges("Agent", (state) => {
     const lastMsg = state.messages[state.messages.length - 1];
     if (lastMsg instanceof AIMessage && lastMsg.tool_calls?.length) {
@@ -193,13 +238,13 @@ const workflow = new StateGraph(AgentState)
     return END;
   })
   
-  .addEdge("tools", "Agent"); // Loop back to Agent to interpret tool output
+  .addEdge("tools", "Agent");
 
-// Memory
 const memory = SqliteSaver.fromConnString(path.resolve(__dirname, "../agent_memory.db"));
 
 const app = workflow.compile({
   checkpointer: memory,
+  interruptBefore: ["tools"], // PAUSE BEFORE ACTIONS
 });
 
 // --- INTERACTIVE LOOP ---
@@ -208,36 +253,56 @@ const question = (q: string) => new Promise<string>((r) => rl.question(q, r));
 
 async function main() {
   let userInput = process.argv[2] || "";
-  const threadId = "dev-session-v2"; // Bumped version for new tools
+  const threadId = "dev-session-v5"; 
   const config = { configurable: { thread_id: threadId } };
 
   if (!userInput) {
     console.log(`\n${clr.green}👨‍💻 Senior Dev Agent Active in: ${CURRENT_WORKING_DIR}${clr.reset}`);
-    userInput = await question(`\n${clr.bright}Ask me about your project:${clr.reset} `);
+    userInput = await question(`\n${clr.bright}Instruct:${clr.reset} `);
   }
 
   while (true) {
     if (userInput.toLowerCase() === 'exit') break;
 
     const inputs = { messages: [new HumanMessage(userInput)] };
+    
+    // 1. Start the first turn
     let stream = await app.stream(inputs, config);
+    await printStream(stream);
 
-    for await (const event of stream) {
-      const [nodeName, output] = Object.entries(event)[0];
-
-      if (nodeName === 'Agent') {
-        const messages = (output as any).messages;
-        if (messages?.length) {
-          const lastMsg = messages[messages.length - 1] as AIMessage;
-          if (lastMsg.content) console.log(`\n${clr.cyan}🤖 Agent:${clr.reset} ${lastMsg.content}`);
-          if (lastMsg.tool_calls?.length) console.log(`${clr.yellow}⚡ Action:${clr.reset} ${lastMsg.tool_calls[0].name}`);
-        }
+    // 2. Chaining Loop: Keep checking if the agent wants to do more (Write -> Run -> etc)
+    while (true) {
+      const snapshot = await app.getState(config);
+      
+      // If agent is done or not paused at tools, break the chaining loop
+      if (snapshot.next.length === 0 || !snapshot.next.includes("tools")) {
+         break;
       }
-      if (nodeName === 'tools') {
-         console.log(`${clr.dim}🛠️  Tool Output Received${clr.reset}`);
+
+      // Agent is paused and wants to run a tool
+      const lastMsg = snapshot.values.messages[snapshot.values.messages.length - 1] as AIMessage;
+      const toolCall = lastMsg.tool_calls?.[0];
+
+      // Ask for permission
+      if (toolCall) {
+        console.log(`${clr.yellow}⚡ Agent wants to: ${clr.bright}${toolCall.name}${clr.reset}`);
+        console.log(`${clr.dim}   Args: ${JSON.stringify(toolCall.args)}${clr.reset}`);
+        
+        const answer = await question(`\n${clr.red}⚠️  PERMISSION REQUIRED:${clr.reset} Allow? (y/n) `);
+        
+        if (answer.toLowerCase() === 'y') {
+           // RESUME EXECUTION
+           const nextStream = await app.stream(null, config);
+           await printStream(nextStream);
+           // Loop continues to check if there is a next step...
+        } else {
+           console.log("❌ Denied.");
+           break;
+        }
       }
     }
 
+    // Only ask for new input when the Agent is completely done with the chain
     userInput = await question(`\n${clr.bright}Next:${clr.reset} `);
   }
   rl.close();
