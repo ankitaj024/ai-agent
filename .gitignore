@@ -1,0 +1,43 @@
+# --- Dependencies ---
+node_modules/
+package-lock.json   # Optional: Keep this if you want to lock versions, ignore if you don't.
+
+# --- Build Output ---
+dist/
+build/
+*.tsbuildinfo
+
+# --- Environment & Secrets (CRITICAL) ---
+.env
+.env.local
+.env.*
+
+# --- Agent Memory (LangGraph SQLite) ---
+agent_memory.db
+agent_memory.db-journal
+agent_memory.db-shm
+agent_memory.db-wal
+*.sqlite
+*.db
+
+# --- Voice & Temp Files ---
+temp_voice_input.wav
+*.wav
+*.mp3
+
+# --- Docker ---
+# If you run docker locally, you might want to ignore local volume data if mapped here
+# docker-compose.override.yml
+
+# --- Logs ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+*.log
+
+# --- System & Editor ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
