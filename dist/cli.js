@@ -33,23 +33,35 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
-const fs = __importStar(require("fs/promises"));
+const fs = __importStar(require("fs"));
+const fsp = __importStar(require("fs/promises"));
 const path = __importStar(require("path"));
 const dotenv_1 = require("dotenv");
-// Load .env
-const packageRoot = typeof __dirname !== 'undefined' ? __dirname : path.dirname(process.argv[1] || '');
-(0, dotenv_1.config)({ path: path.join(packageRoot, '..', '.env') });
+const child_process_1 = require("child_process");
+const util_1 = require("util");
 const readline = __importStar(require("readline"));
 const zod_1 = require("zod");
-// --- IMPORTS ---
+// --- EXTERNAL LIBS ---
+const diff = __importStar(require("diff"));
+// --- AUDIO IMPORTS ---
+// @ts-ignore
+const recorder = __importStar(require("node-record-lpcm16"));
+const groq_sdk_1 = __importDefault(require("groq-sdk"));
 const groq_1 = require("@langchain/groq");
+// --- LANGCHAIN IMPORTS ---
 const tavily_search_api_1 = require("@langchain/community/retrievers/tavily_search_api");
 const langgraph_1 = require("@langchain/langgraph");
 const langgraph_checkpoint_sqlite_1 = require("@langchain/langgraph-checkpoint-sqlite");
 const prebuilt_1 = require("@langchain/langgraph/prebuilt");
 const messages_1 = require("@langchain/core/messages");
 const tools_1 = require("@langchain/core/tools");
+// Load .env
+const packageRoot = typeof __dirname !== 'undefined' ? __dirname : path.dirname(process.argv[1] || '');
+(0, dotenv_1.config)({ path: path.join(packageRoot, '..', '.env') });
 const clr = {
     reset: "\x1b[0m",
     bright: "\x1b[1m",
@@ -61,20 +73,20 @@ const clr = {
     dim: "\x1b[2m",
 };
 const CURRENT_WORKING_DIR = process.cwd();
+const execAsync = (0, util_1.promisify)(child_process_1.exec);
+const groq = new groq_sdk_1.default({ apiKey: process.env.GROQ_API_KEY });
 // --- HELPER FUNCTIONS ---
-// Helper for Recursive File Listing
 async function getFileTree(dir, depth = 0, maxDepth = 2) {
     if (depth > maxDepth)
         return "";
     try {
-        const files = await fs.readdir(dir);
+        const files = await fsp.readdir(dir);
         let output = "";
         for (const file of files) {
-            // Ignore common clutter folders to keep the tree clean
             if (['node_modules', '.git', 'dist', '.next', '.DS_Store', 'coverage'].includes(file))
                 continue;
             const fullPath = path.join(dir, file);
-            const stat = await fs.stat(fullPath);
+            const stat = await fsp.stat(fullPath);
             const prefix = "  ".repeat(depth) + "|-- ";
             output += `${prefix}${file}\n`;
             if (stat.isDirectory()) {
@@ -84,11 +96,157 @@ async function getFileTree(dir, depth = 0, maxDepth = 2) {
         return output;
     }
     catch (e) {
-        return ""; // Skip folders we can't read
+        return "";
     }
 }
+// --- PROJECT CONTEXT LOADER (FIXED TYPE) ---
+async function loadProjectContext() {
+    const context = [];
+    // FIX: Explicitly type this as string[] so TS doesn't think it's 'never[]'
+    const files = await fsp.readdir(CURRENT_WORKING_DIR).catch(() => []);
+    if (files.includes('package.json')) {
+        try {
+            const content = await fsp.readFile(path.join(CURRENT_WORKING_DIR, 'package.json'), 'utf-8');
+            const pkg = JSON.parse(content);
+            context.push(`[Node.js Project Detected]`);
+            if (pkg.name)
+                context.push(`- Name: ${pkg.name}`);
+            if (pkg.scripts)
+                context.push(`- Scripts: ${Object.keys(pkg.scripts).join(', ')}`);
+            if (pkg.dependencies)
+                context.push(`- Main Deps: ${Object.keys(pkg.dependencies).slice(0, 10).join(', ')}`);
+        }
+        catch { /* ignore bad json */ }
+    }
+    if (files.includes('requirements.txt')) {
+        context.push(`[Python Project Detected]`);
+        const content = await fsp.readFile(path.join(CURRENT_WORKING_DIR, 'requirements.txt'), 'utf-8');
+        context.push(`- Requirements: ${content.split('\n').slice(0, 5).join(', ')}...`);
+    }
+    if (files.includes('Dockerfile') || files.includes('docker-compose.yml')) {
+        context.push(`[Docker Detected]`);
+    }
+    if (files.includes('README.md')) {
+        const content = await fsp.readFile(path.join(CURRENT_WORKING_DIR, 'README.md'), 'utf-8');
+        context.push(`[README Summary]: ${content.slice(0, 300).replace(/\n/g, ' ')}...`);
+    }
+    return context.length > 0 ? context.join('\n') : "No specific project configuration found.";
+}
+async function printStream(stream) {
+    for await (const event of stream) {
+        const [nodeName, output] = Object.entries(event)[0];
+        if (nodeName === 'Agent') {
+            const messages = output.messages;
+            if (messages?.length) {
+                const lastMsg = messages[messages.length - 1];
+                if (lastMsg.content)
+                    console.log(`\n${clr.cyan}🤖 Agent:${clr.reset} ${lastMsg.content}`);
+            }
+        }
+        if (nodeName === 'tools') {
+            const messages = output.messages;
+            if (messages?.length) {
+                const lastMsg = messages[messages.length - 1];
+                if (lastMsg.content) {
+                    console.log(`${clr.green}📜 Output:${clr.reset}\n${lastMsg.content}`);
+                }
+            }
+        }
+    }
+}
+function askQuestion(query, prefill = "") {
+    const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+    });
+    return new Promise((resolve) => {
+        rl.question(query, (answer) => {
+            rl.close();
+            resolve(answer);
+        });
+        if (prefill) {
+            rl.write(prefill);
+        }
+    });
+}
+function showDiff(filePath, newContent) {
+    const target = path.resolve(CURRENT_WORKING_DIR, filePath);
+    if (!fs.existsSync(target)) {
+        console.log(clr.green + `\n+++ Creating NEW file: ${filePath}` + clr.reset);
+        const lines = newContent.split('\n');
+        console.log(lines.slice(0, 10).join('\n') + (lines.length > 10 ? `\n... (${lines.length - 10} more lines)` : ''));
+        return;
+    }
+    const oldContent = fs.readFileSync(target, 'utf-8');
+    const changes = diff.diffLines(oldContent, newContent);
+    let hasChanges = false;
+    console.log(clr.yellow + `\n📝 Proposed Changes for: ${filePath}` + clr.reset);
+    console.log(clr.dim + '--------------------------------------' + clr.reset);
+    changes.forEach(part => {
+        if (part.added || part.removed) {
+            hasChanges = true;
+            const color = part.added ? clr.green : clr.red;
+            const prefix = part.added ? '+ ' : '- ';
+            process.stdout.write(color + part.value.replace(/^/gm, prefix) + clr.reset);
+        }
+    });
+    if (!hasChanges) {
+        console.log(clr.dim + "No actual changes detected." + clr.reset);
+    }
+    console.log(clr.dim + '--------------------------------------\n' + clr.reset);
+}
+// --- VOICE CAPTURE ---
+async function captureVoice() {
+    return new Promise((resolve, reject) => {
+        const filePath = path.join(CURRENT_WORKING_DIR, 'temp_voice_input.wav');
+        const fileStream = fs.createWriteStream(filePath, { encoding: 'binary' });
+        console.log(`\n${clr.red}🎙️  Recording... Press CTRL+C to stop.${clr.reset}`);
+        const recording = recorder.record({
+            sampleRate: 16000,
+            threshold: 0,
+            verbose: false,
+            recordProgram: 'rec',
+            silence: '10.0',
+        });
+        recording.stream().pipe(fileStream);
+        const cleanup = () => {
+            process.stdin.removeListener('keypress', handleKey);
+            if (process.stdin.isTTY)
+                process.stdin.setRawMode(false);
+            recording.stop();
+        };
+        const handleKey = (str, key) => {
+            if (key && key.ctrl && key.name === 'c') {
+                cleanup();
+                console.log(`${clr.yellow}⏳ Transcribing...${clr.reset}`);
+                setTimeout(async () => {
+                    try {
+                        const transcription = await groq.audio.transcriptions.create({
+                            file: fs.createReadStream(filePath),
+                            model: "whisper-large-v3",
+                            response_format: "text"
+                        });
+                        if (fs.existsSync(filePath))
+                            fs.unlinkSync(filePath);
+                        const text = transcription.toString().trim();
+                        resolve(text);
+                    }
+                    catch (error) {
+                        if (fs.existsSync(filePath))
+                            fs.unlinkSync(filePath);
+                        reject(error);
+                    }
+                }, 1000);
+            }
+        };
+        if (process.stdin.isTTY) {
+            process.stdin.setRawMode(true);
+            process.stdin.resume();
+            process.stdin.on('keypress', handleKey);
+        }
+    });
+}
 // --- TOOLS ---
-// 1. Web Search
 const searchTool = (0, tools_1.tool)(async ({ query }) => {
     try {
         const safeQuery = query.slice(0, 200);
@@ -101,10 +259,9 @@ const searchTool = (0, tools_1.tool)(async ({ query }) => {
     }
 }, {
     name: "tavily_search",
-    description: "Search the web for documentation, library versions, or error solutions.",
+    description: "Search the web for docs, library versions, or error fixes.",
     schema: zod_1.z.object({ query: zod_1.z.string() })
 });
-// 2. Smart Recursive List Files
 const listFilesTool = (0, tools_1.tool)(async ({ dirPath, depth }) => {
     try {
         const target = path.resolve(CURRENT_WORKING_DIR, dirPath || ".");
@@ -115,40 +272,65 @@ const listFilesTool = (0, tools_1.tool)(async ({ dirPath, depth }) => {
     }
 }, {
     name: "list_files",
-    description: "View the project file structure as a tree. Use 'depth' (default 2) to see subfolders.",
+    description: "View project file structure. Use 'depth' (default 2) to see subfolders.",
     schema: zod_1.z.object({ dirPath: zod_1.z.string().optional(), depth: zod_1.z.number().optional() })
 });
-// 3. Smart Read File (Line Numbers & Ranges)
 const readFileTool = (0, tools_1.tool)(async ({ filePath, startLine, endLine }) => {
     try {
         const target = path.resolve(CURRENT_WORKING_DIR, filePath);
-        // Basic Security
-        if (filePath.includes('.env') || filePath.includes('id_rsa')) {
-            return "⚠️ Error: Access to sensitive files (keys/secrets) is restricted for security.";
-        }
-        const content = await fs.readFile(target, 'utf-8');
+        if (filePath.includes('.env') || filePath.includes('id_rsa'))
+            return "⚠️ Error: Restricted file.";
+        const content = await fsp.readFile(target, 'utf-8');
         const lines = content.split('\n');
         const start = startLine ? startLine - 1 : 0;
         const end = endLine ? endLine : lines.length;
-        // Limit to 300 lines per read to prevent context overflow
-        if (end - start > 300) {
-            return `⚠️ Error: The file is too large to read at once. Please read chunks of 300 lines or less. (Example: startLine: ${start + 1}, endLine: ${start + 300})`;
-        }
-        // Add line numbers to the output
-        const selectedLines = lines.slice(start, end).map((line, i) => `${start + i + 1}: ${line}`);
-        return selectedLines.join('\n');
+        if (end - start > 300)
+            return `⚠️ Error: File too large. Read lines ${start + 1}-${start + 300} instead.`;
+        return lines.slice(start, end).map((line, i) => `${start + i + 1}: ${line}`).join('\n');
     }
     catch (e) {
         return `Error: ${e.message}`;
     }
 }, {
     name: "read_file",
-    description: "Read file content with line numbers. Use startLine/endLine to read large files in chunks.",
+    description: "Read file content with line numbers.",
     schema: zod_1.z.object({
         filePath: zod_1.z.string(),
-        startLine: zod_1.z.number().optional().describe("Start line number (1-based)"),
-        endLine: zod_1.z.number().optional().describe("End line number (inclusive)")
+        startLine: zod_1.z.number().optional(),
+        endLine: zod_1.z.number().optional()
     })
+});
+const writeFileTool = (0, tools_1.tool)(async ({ filePath, content }) => {
+    try {
+        const target = path.resolve(CURRENT_WORKING_DIR, filePath);
+        await fsp.writeFile(target, content);
+        return `✅ Successfully wrote to ${filePath}`;
+    }
+    catch (e) {
+        return `Error: ${e.message}`;
+    }
+}, {
+    name: "write_file",
+    description: "Write content to a file. Overwrites existing files.",
+    schema: zod_1.z.object({ filePath: zod_1.z.string(), content: zod_1.z.string() })
+});
+// --- UPDATED TERMINAL TOOL (SELF-HEALING) ---
+const terminalTool = (0, tools_1.tool)(async ({ command }) => {
+    try {
+        if (command.includes('rm -rf') || command.includes('sudo') || command.includes('format')) {
+            return "❌ Error: Command blocked for safety.";
+        }
+        const { stdout, stderr } = await execAsync(command, { cwd: CURRENT_WORKING_DIR });
+        return stdout || stderr || "✅ Command executed successfully.";
+    }
+    catch (e) {
+        // Return error to Agent so it can fix it
+        return `❌ Command Failed:\n${e.message}\n\nSTDERR:\n${e.stderr || 'No stderr'}`;
+    }
+}, {
+    name: "terminal",
+    description: "Execute safe terminal commands (npm, git, node, etc).",
+    schema: zod_1.z.object({ command: zod_1.z.string() })
 });
 // --- GRAPH SETUP ---
 const AgentState = langgraph_1.Annotation.Root({
@@ -158,39 +340,40 @@ if (!process.env.GROQ_API_KEY) {
     console.error('❌ Error: GROQ_API_KEY is missing in .env');
     process.exit(1);
 }
-// Initializing Llama 3 for best tool-calling performance
 const llm = new groq_1.ChatGroq({
     model: "llama-3.3-70b-versatile",
     temperature: 0,
     apiKey: process.env.GROQ_API_KEY,
 });
-// --- NODE LOGIC ---
 const agentNode = async (state) => {
-    const tools = [listFilesTool, readFileTool, searchTool];
+    const tools = [listFilesTool, readFileTool, searchTool, writeFileTool, terminalTool];
     const nodeLLM = llm.bindTools(tools);
+    const projectContext = await loadProjectContext();
     const systemMsg = new messages_1.SystemMessage(`
     You are a Senior Developer Assistant.
-    You have access to the files in: ${CURRENT_WORKING_DIR}
+    
+    You have access to: ${CURRENT_WORKING_DIR}
 
-    GOAL: Answer the user's questions accurately by reading their code or searching the web.
+    🚀 PROJECT CONTEXT:
+    ${projectContext}
 
-    GUIDELINES:
-    1. **Context First:** Always use 'list_files' to see the project structure before guessing file names.
-    2. **Smart Reading:** - If a file seems large, read the first 100 lines (startLine: 1, endLine: 100).
-       - If you need to see a specific function, read the lines around it.
-       - Use the Line Numbers provided in the output to reference code in your answer (e.g., "The bug is on line 42").
-    3. **Web Search:** Use 'tavily_search' for libraries, errors, or documentation.
-    4. **Be Concise:** Don't dump code unless asked. Explain the solution.
+    CAPABILITIES:
+    1. **See:** Use 'list_files' and 'read_file' to explore code.
+    2. **Research:** Use 'tavily_search' for docs/errors.
+    3. **Act:** Use 'write_file' to fix code and 'terminal' to run commands.
+
+    RULES:
+    - **Context First:** Look before you leap. Read files before editing them.
+    - **Safety:** You must be precise when writing code.
+    - **Verification:** After writing code, try to run it (e.g., 'node file.js') if appropriate to verify it works.
   `);
     const response = await nodeLLM.invoke([systemMsg, ...state.messages]);
     return { messages: [response] };
 };
-// --- GRAPH CONSTRUCTION ---
 const workflow = new langgraph_1.StateGraph(AgentState)
     .addNode("Agent", agentNode)
-    .addNode("tools", new prebuilt_1.ToolNode([listFilesTool, readFileTool, searchTool]))
+    .addNode("tools", new prebuilt_1.ToolNode([listFilesTool, readFileTool, searchTool, writeFileTool, terminalTool]))
     .addEdge(langgraph_1.START, "Agent")
-    // Logic: If the agent calls a tool, go to 'tools', otherwise END.
     .addConditionalEdges("Agent", (state) => {
     const lastMsg = state.messages[state.messages.length - 1];
     if (lastMsg instanceof messages_1.AIMessage && lastMsg.tool_calls?.length) {
@@ -198,46 +381,71 @@ const workflow = new langgraph_1.StateGraph(AgentState)
     }
     return langgraph_1.END;
 })
-    .addEdge("tools", "Agent"); // Loop back to Agent to interpret tool output
-// Memory
+    .addEdge("tools", "Agent");
 const memory = langgraph_checkpoint_sqlite_1.SqliteSaver.fromConnString(path.resolve(__dirname, "../agent_memory.db"));
 const app = workflow.compile({
     checkpointer: memory,
+    interruptBefore: ["tools"],
 });
-// --- INTERACTIVE LOOP ---
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-const question = (q) => new Promise((r) => rl.question(q, r));
+// --- MAIN LOOP ---
 async function main() {
     let userInput = process.argv[2] || "";
-    const threadId = "dev-session-v2"; // Bumped version for new tools
+    const threadId = "dev-session-v5";
     const config = { configurable: { thread_id: threadId } };
+    console.log(`\n${clr.green}👨‍💻 Senior Dev Agent Active in: ${CURRENT_WORKING_DIR}${clr.reset}`);
     if (!userInput) {
-        console.log(`\n${clr.green}👨‍💻 Senior Dev Agent Active in: ${CURRENT_WORKING_DIR}${clr.reset}`);
-        userInput = await question(`\n${clr.bright}Ask me about your project:${clr.reset} `);
+        userInput = await askQuestion(`\n${clr.bright}Instruct (or 'v' for voice):${clr.reset} `);
     }
     while (true) {
         if (userInput.toLowerCase() === 'exit')
             break;
-        const inputs = { messages: [new messages_1.HumanMessage(userInput)] };
-        let stream = await app.stream(inputs, config);
-        for await (const event of stream) {
-            const [nodeName, output] = Object.entries(event)[0];
-            if (nodeName === 'Agent') {
-                const messages = output.messages;
-                if (messages?.length) {
-                    const lastMsg = messages[messages.length - 1];
-                    if (lastMsg.content)
-                        console.log(`\n${clr.cyan}🤖 Agent:${clr.reset} ${lastMsg.content}`);
-                    if (lastMsg.tool_calls?.length)
-                        console.log(`${clr.yellow}⚡ Action:${clr.reset} ${lastMsg.tool_calls[0].name}`);
+        if (userInput.toLowerCase() === 'v') {
+            try {
+                const transcribedText = await captureVoice();
+                if (!transcribedText) {
+                    userInput = await askQuestion(`\n${clr.bright}Instruct (or 'v' for voice):${clr.reset} `);
+                    continue;
                 }
+                console.log(`${clr.green}🗣️  Recognized:${clr.reset} "${transcribedText}"`);
+                userInput = await askQuestion(`${clr.bright}Edit/Confirm:${clr.reset} `, transcribedText);
             }
-            if (nodeName === 'tools') {
-                console.log(`${clr.dim}🛠️  Tool Output Received${clr.reset}`);
+            catch (e) {
+                console.log("Voice Error:", e.message || e);
+                userInput = await askQuestion(`\n${clr.bright}Instruct (or 'v' for voice):${clr.reset} `);
+                continue;
             }
         }
-        userInput = await question(`\n${clr.bright}Next:${clr.reset} `);
+        const inputs = { messages: [new messages_1.HumanMessage(userInput)] };
+        let stream = await app.stream(inputs, config);
+        await printStream(stream);
+        while (true) {
+            const snapshot = await app.getState(config);
+            if (snapshot.next.length === 0 || !snapshot.next.includes("tools")) {
+                break;
+            }
+            const lastMsg = snapshot.values.messages[snapshot.values.messages.length - 1];
+            const toolCall = lastMsg.tool_calls?.[0];
+            if (toolCall) {
+                console.log(`${clr.yellow}⚡ Agent wants to: ${clr.bright}${toolCall.name}${clr.reset}`);
+                if (toolCall.name === 'write_file') {
+                    const args = toolCall.args;
+                    showDiff(args.filePath, args.content);
+                }
+                else {
+                    console.log(`${clr.dim}   Args: ${JSON.stringify(toolCall.args)}${clr.reset}`);
+                }
+                const answer = await askQuestion(`\n${clr.red}⚠️  PERMISSION REQUIRED:${clr.reset} Allow? (y/n) `);
+                if (answer.toLowerCase() === 'y') {
+                    const nextStream = await app.stream(null, config);
+                    await printStream(nextStream);
+                }
+                else {
+                    console.log("❌ Denied.");
+                    break;
+                }
+            }
+        }
+        userInput = await askQuestion(`\n${clr.bright}Next (or 'v'):${clr.reset} `);
     }
-    rl.close();
 }
 main();
